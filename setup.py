@@ -1,16 +1,18 @@
-# Copyright (c) 2023, Tri Dao.
+# Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 
 import sys
-import functools
 import warnings
 import os
+import stat
 import re
-import ast
-import glob
 import shutil
+import ast
 from pathlib import Path
 from packaging.version import parse, Version
 import platform
+import sysconfig
+import tarfile
+import itertools
 
 from setuptools import setup, find_packages
 import subprocess
@@ -20,14 +22,7 @@ import urllib.error
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 import torch
-from torch.utils.cpp_extension import (
-    BuildExtension,
-    CppExtension,
-    CUDAExtension,
-    CUDA_HOME,
-    ROCM_HOME,
-    IS_HIP_EXTENSION,
-)
+from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
 
 
 with open("README.md", "r", encoding="utf-8") as fh:
@@ -37,24 +32,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
-
-if BUILD_TARGET == "auto":
-    if IS_HIP_EXTENSION:
-        IS_ROCM = True
-    else:
-        IS_ROCM = False
-else:
-    if BUILD_TARGET == "cuda":
-        IS_ROCM = False
-    elif BUILD_TARGET == "rocm":
-        IS_ROCM = True
-
-PACKAGE_NAME = "flash_attn"
-
-BASE_WHEEL_URL = (
-    "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
-)
+PACKAGE_NAME = "flash_attn_3_nv"
 
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
@@ -62,12 +40,264 @@ FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
-USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
-SKIP_CK_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CK_BUILD", "TRUE") == "TRUE" if USE_TRITON_ROCM else False
 
-@functools.lru_cache(maxsize=None)
-def cuda_archs() -> str:
-    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;110;120").split(";")
+DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
+DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
+DISABLE_PAGEDKV = os.getenv("FLASH_ATTENTION_DISABLE_PAGEDKV", "FALSE") == "TRUE"
+DISABLE_APPENDKV = os.getenv("FLASH_ATTENTION_DISABLE_APPENDKV", "FALSE") == "TRUE"
+DISABLE_LOCAL = os.getenv("FLASH_ATTENTION_DISABLE_LOCAL", "FALSE") == "TRUE"
+DISABLE_SOFTCAP = os.getenv("FLASH_ATTENTION_DISABLE_SOFTCAP", "FALSE") == "TRUE"
+DISABLE_PACKGQA = os.getenv("FLASH_ATTENTION_DISABLE_PACKGQA", "FALSE") == "TRUE"
+DISABLE_FP16 = os.getenv("FLASH_ATTENTION_DISABLE_FP16", "FALSE") == "TRUE"
+DISABLE_FP8 = os.getenv("FLASH_ATTENTION_DISABLE_FP8", "FALSE") == "TRUE"
+DISABLE_VARLEN = os.getenv("FLASH_ATTENTION_DISABLE_VARLEN", "FALSE") == "TRUE"
+DISABLE_CLUSTER = os.getenv("FLASH_ATTENTION_DISABLE_CLUSTER", "FALSE") == "TRUE"
+DISABLE_HDIM64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM64", "FALSE") == "TRUE"
+DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
+DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
+DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
+DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
+DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
+
+ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
+
+DISABLE_HDIMDIFF64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF64", "FALSE") == "TRUE"
+DISABLE_HDIMDIFF192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF192", "FALSE") == "TRUE"
+
+# HACK: we monkey patch pytorch's _write_ninja_file to pass
+# "-gencode arch=compute_sm90a,code=sm_90a" to files ending in '_sm90.cu',
+# and pass "-gencode arch=compute_sm80,code=sm_80" to files ending in '_sm80.cu'
+from torch.utils.cpp_extension import (
+    IS_HIP_EXTENSION,
+    COMMON_HIP_FLAGS,
+    SUBPROCESS_DECODE_ARGS,
+    IS_WINDOWS,
+    get_cxx_compiler,
+    _join_rocm_home,
+    _join_cuda_home,
+    _is_cuda_file,
+    _maybe_write,
+)
+
+def create_build_config_file():
+    CONFIG = {
+        "build_flags": {
+            "FLASHATTENTION_DISABLE_BACKWARD": DISABLE_BACKWARD,
+            "FLASHATTENTION_DISABLE_SPLIT": DISABLE_SPLIT,
+            "FLASHATTENTION_DISABLE_PAGEDKV": DISABLE_PAGEDKV,
+            "FLASHATTENTION_DISABLE_APPENDKV": DISABLE_APPENDKV,
+            "FLASHATTENTION_DISABLE_LOCAL": DISABLE_LOCAL,
+            "FLASHATTENTION_DISABLE_SOFTCAP": DISABLE_SOFTCAP,
+            "FLASHATTENTION_DISABLE_PACKGQA": DISABLE_PACKGQA,
+            "FLASHATTENTION_DISABLE_FP16": DISABLE_FP16,
+            "FLASHATTENTION_DISABLE_FP8": DISABLE_FP8,
+            "FLASHATTENTION_DISABLE_VARLEN": DISABLE_VARLEN,
+            "FLASHATTENTION_DISABLE_CLUSTER": DISABLE_CLUSTER,
+            "FLASHATTENTION_DISABLE_HDIM64": DISABLE_HDIM64,
+            "FLASHATTENTION_DISABLE_HDIM96": DISABLE_HDIM96,
+            "FLASHATTENTION_DISABLE_HDIM128": DISABLE_HDIM128,
+            "FLASHATTENTION_DISABLE_HDIM192": DISABLE_HDIM192,
+            "FLASHATTENTION_DISABLE_HDIM256": DISABLE_HDIM256,
+            "FLASHATTENTION_DISABLE_SM8x": DISABLE_SM8x,
+            "FLASHATTENTION_ENABLE_VCOLMAJOR": ENABLE_VCOLMAJOR,
+            "FLASH_ATTENTION_DISABLE_HDIMDIFF64": DISABLE_HDIMDIFF64,
+            "FLASH_ATTENTION_DISABLE_HDIMDIFF192": DISABLE_HDIMDIFF192,
+        }
+    }
+
+    with open("flash_attn_config.py", "w") as f:
+        f.write("# Auto-generated by flash attention 3 setup.py\n")
+        f.write(f"CONFIG = {repr(CONFIG)}\n")
+        f.write("\n")
+
+        f.write("def show():\n")
+        f.write("    from pprint import pprint\n")
+        f.write("    pprint(CONFIG)\n")
+        f.write("\n")
+
+def _write_ninja_file(path,
+                      cflags,
+                      post_cflags,
+                      cuda_cflags,
+                      cuda_post_cflags,
+                      cuda_dlink_post_cflags,
+                      sources,
+                      objects,
+                      ldflags,
+                      library_target,
+                      with_cuda,
+                      **kwargs,  # kwargs (ignored) to absorb new flags in torch.utils.cpp_extension
+                      ) -> None:
+    r"""Write a ninja file that does the desired compiling and linking.
+
+    `path`: Where to write this file
+    `cflags`: list of flags to pass to $cxx. Can be None.
+    `post_cflags`: list of flags to append to the $cxx invocation. Can be None.
+    `cuda_cflags`: list of flags to pass to $nvcc. Can be None.
+    `cuda_postflags`: list of flags to append to the $nvcc invocation. Can be None.
+    `sources`: list of paths to source files
+    `objects`: list of desired paths to objects, one per source.
+    `ldflags`: list of flags to pass to linker. Can be None.
+    `library_target`: Name of the output library. Can be None; in that case,
+                      we do no linking.
+    `with_cuda`: If we should be compiling with CUDA.
+    """
+    def sanitize_flags(flags):
+        if flags is None:
+            return []
+        else:
+            return [flag.strip() for flag in flags]
+
+    cflags = sanitize_flags(cflags)
+    post_cflags = sanitize_flags(post_cflags)
+    cuda_cflags = sanitize_flags(cuda_cflags)
+    cuda_post_cflags = sanitize_flags(cuda_post_cflags)
+    cuda_dlink_post_cflags = sanitize_flags(cuda_dlink_post_cflags)
+    ldflags = sanitize_flags(ldflags)
+
+    # Sanity checks...
+    assert len(sources) == len(objects)
+    assert len(sources) > 0
+
+    compiler = get_cxx_compiler()
+
+    # Version 1.3 is required for the `deps` directive.
+    config = ['ninja_required_version = 1.3']
+    config.append(f'cxx = {compiler}')
+    if with_cuda or cuda_dlink_post_cflags:
+        if IS_HIP_EXTENSION:
+            nvcc = _join_rocm_home('bin', 'hipcc')
+        else:
+            nvcc = _join_cuda_home('bin', 'nvcc')
+        if "PYTORCH_NVCC" in os.environ:
+            nvcc_from_env = os.getenv("PYTORCH_NVCC")    # user can set nvcc compiler with ccache using the environment variable here
+        else:
+            nvcc_from_env = nvcc
+        config.append(f'nvcc_from_env = {nvcc_from_env}')
+        config.append(f'nvcc = {nvcc}')
+
+    if IS_HIP_EXTENSION:
+        post_cflags = COMMON_HIP_FLAGS + post_cflags
+    flags = [f'cflags = {" ".join(cflags)}']
+    flags.append(f'post_cflags = {" ".join(post_cflags)}')
+    if with_cuda:
+        flags.append(f'cuda_cflags = {" ".join(cuda_cflags)}')
+        flags.append(f'cuda_post_cflags = {" ".join(cuda_post_cflags)}')
+        cuda_post_cflags_sm80 = [s if s != 'arch=compute_90a,code=sm_90a' else 'arch=compute_80,code=sm_80' for s in cuda_post_cflags]
+        flags.append(f'cuda_post_cflags_sm80 = {" ".join(cuda_post_cflags_sm80)}')
+        cuda_post_cflags_sm80_sm90 = cuda_post_cflags + ['-gencode', 'arch=compute_80,code=sm_80']
+        flags.append(f'cuda_post_cflags_sm80_sm90 = {" ".join(cuda_post_cflags_sm80_sm90)}')
+        cuda_post_cflags_sm100 = [s if s != 'arch=compute_90a,code=sm_90a' else 'arch=compute_100a,code=sm_100a' for s in cuda_post_cflags]
+        flags.append(f'cuda_post_cflags_sm100 = {" ".join(cuda_post_cflags_sm100)}')
+    flags.append(f'cuda_dlink_post_cflags = {" ".join(cuda_dlink_post_cflags)}')
+    flags.append(f'ldflags = {" ".join(ldflags)}')
+
+    # Turn into absolute paths so we can emit them into the ninja build
+    # file wherever it is.
+    sources = [os.path.abspath(file) for file in sources]
+
+    # See https://ninja-build.org/build.ninja.html for reference.
+    compile_rule = ['rule compile']
+    if IS_WINDOWS:
+        compile_rule.append(
+            '  command = cl /showIncludes $cflags -c $in /Fo$out $post_cflags')
+        compile_rule.append('  deps = msvc')
+    else:
+        compile_rule.append(
+            '  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags')
+        compile_rule.append('  depfile = $out.d')
+        compile_rule.append('  deps = gcc')
+
+    if with_cuda:
+        cuda_compile_rule = ['rule cuda_compile']
+        nvcc_gendeps = ''
+        # --generate-dependencies-with-compile is not supported by ROCm
+        # Nvcc flag `--generate-dependencies-with-compile` is not supported by sccache, which may increase build time.
+        if torch.version.cuda is not None and os.getenv('TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES', '0') != '1':
+            cuda_compile_rule.append('  depfile = $out.d')
+            cuda_compile_rule.append('  deps = gcc')
+            # Note: non-system deps with nvcc are only supported
+            # on Linux so use --generate-dependencies-with-compile
+            # to make this work on Windows too.
+            nvcc_gendeps = '--generate-dependencies-with-compile --dependency-output $out.d'
+        cuda_compile_rule_sm80 = ['rule cuda_compile_sm80'] + cuda_compile_rule[1:] + [
+            f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm80'
+        ]
+        cuda_compile_rule_sm80_sm90 = ['rule cuda_compile_sm80_sm90'] + cuda_compile_rule[1:] + [
+            f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm80_sm90'
+        ]
+        cuda_compile_rule_sm100 = ['rule cuda_compile_sm100'] + cuda_compile_rule[1:] + [
+            f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm100'
+        ]
+        cuda_compile_rule.append(
+            f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags')
+
+    # Emit one build rule per source to enable incremental build.
+    build = []
+    for source_file, object_file in zip(sources, objects):
+        is_cuda_source = _is_cuda_file(source_file) and with_cuda
+        if is_cuda_source:
+            if source_file.endswith('_sm90.cu'):
+                rule = 'cuda_compile'
+            elif source_file.endswith('_sm80.cu'):
+                rule = 'cuda_compile_sm80'
+            elif source_file.endswith('_sm100.cu'):
+                rule = 'cuda_compile_sm100'
+            else:
+                rule = 'cuda_compile_sm80_sm90'
+        else:
+            rule = 'compile'
+        if IS_WINDOWS:
+            source_file = source_file.replace(':', '$:')
+            object_file = object_file.replace(':', '$:')
+        source_file = source_file.replace(" ", "$ ")
+        object_file = object_file.replace(" ", "$ ")
+        build.append(f'build {object_file}: {rule} {source_file}')
+
+    if cuda_dlink_post_cflags:
+        devlink_out = os.path.join(os.path.dirname(objects[0]), 'dlink.o')
+        devlink_rule = ['rule cuda_devlink']
+        devlink_rule.append('  command = $nvcc $in -o $out $cuda_dlink_post_cflags')
+        devlink = [f'build {devlink_out}: cuda_devlink {" ".join(objects)}']
+        objects += [devlink_out]
+    else:
+        devlink_rule, devlink = [], []
+
+    if library_target is not None:
+        link_rule = ['rule link']
+        if IS_WINDOWS:
+            cl_paths = subprocess.check_output(['where',
+                                                'cl']).decode(*SUBPROCESS_DECODE_ARGS).split('\r\n')
+            if len(cl_paths) >= 1:
+                cl_path = os.path.dirname(cl_paths[0]).replace(':', '$:')
+            else:
+                raise RuntimeError("MSVC is required to load C++ extensions")
+            link_rule.append(f'  command = "{cl_path}/link.exe" $in /nologo $ldflags /out:$out')
+        else:
+            link_rule.append('  command = $cxx $in $ldflags -o $out')
+
+        link = [f'build {library_target}: link {" ".join(objects)}']
+
+        default = [f'default {library_target}']
+    else:
+        link_rule, link, default = [], [], []
+
+    # 'Blocks' should be separated by newlines, for visual benefit.
+    blocks = [config, flags, compile_rule]
+    if with_cuda:
+        blocks.append(cuda_compile_rule)  # type: ignore[possibly-undefined]
+        blocks.append(cuda_compile_rule_sm80)  # type: ignore[possibly-undefined]
+        blocks.append(cuda_compile_rule_sm80_sm90)  # type: ignore[possibly-undefined]
+        blocks.append(cuda_compile_rule_sm100)  # type: ignore[possibly-undefined]
+    blocks += [devlink_rule, link_rule, build, devlink, link, default]
+    content = "\n\n".join("\n".join(b) for b in blocks)
+    # Ninja requires a new lines at the end of the .ninja file
+    content += "\n"
+    _maybe_write(path, content)
+
+
+# Monkey patching
+torch.utils.cpp_extension._write_ninja_file = _write_ninja_file
 
 
 def get_platform():
@@ -75,7 +305,7 @@ def get_platform():
     Returns the platform name as used in wheel filenames.
     """
     if sys.platform.startswith("linux"):
-        return f'linux_{platform.uname().machine}'
+        return "linux_x86_64"
     elif sys.platform == "darwin":
         mac_version = ".".join(platform.mac_ver()[0].split(".")[:2])
         return f"macosx_{mac_version}_x86_64"
@@ -94,63 +324,6 @@ def get_cuda_bare_metal_version(cuda_dir):
     return raw_output, bare_metal_version
 
 
-def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
-    """
-    Adds -gencode flags based on nvcc capabilities:
-      - sm_80/90 (regular)
-      - sm_100/120 on CUDA >= 12.8
-      - Use 100f on CUDA >= 12.9 (Blackwell family-specific)
-      - Map requested 110 -> 101 if CUDA < 13.0 (Thor rename)
-      - Embed PTX for newest arch for forward compatibility
-    """
-    # Always-regular 80
-    if "80" in archs:
-        cc_flag += ["-gencode", "arch=compute_80,code=sm_80"]
-
-    # Hopper 9.0 needs >= 11.8
-    if bare_metal_version >= Version("11.8") and "90" in archs:
-        cc_flag += ["-gencode", "arch=compute_90,code=sm_90"]
-
-    # Blackwell 10.x requires >= 12.8
-    if bare_metal_version >= Version("12.8"):
-        if "100" in archs:
-            # CUDA 12.9 introduced "family-specific" for Blackwell (100f)
-            if bare_metal_version >= Version("12.9"):
-                cc_flag += ["-gencode", "arch=compute_100f,code=sm_100"]
-            else:
-                cc_flag += ["-gencode", "arch=compute_100,code=sm_100"]
-
-        if "120" in archs:
-            # sm_120 is supported in CUDA 12.8/12.9+ toolkits
-            if bare_metal_version >= Version("12.9"):
-                cc_flag += ["-gencode", "arch=compute_120f,code=sm_120"]
-            else:
-                cc_flag += ["-gencode", "arch=compute_120,code=sm_120"]
-
-
-        # Thor rename: 12.9 uses sm_101; 13.0+ uses sm_110
-        if "110" in archs:
-            if bare_metal_version >= Version("13.0"):
-                cc_flag += ["-gencode", "arch=compute_110f,code=sm_110"]
-            else:
-                # Provide Thor support for CUDA 12.9 via sm_101
-                if bare_metal_version >= Version("12.8"):
-                    cc_flag += ["-gencode", "arch=compute_101,code=sm_101"]
-                # else: no Thor support in older toolkits
-
-    # PTX for newest requested arch (forward-compat)
-    numeric = [a for a in archs if a.isdigit()]
-    if numeric:
-        newest = max(numeric, key=int)
-        cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
-
-    return cc_flag
-
-
-def get_hip_version():
-    return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
-
-
 def check_if_cuda_home_none(global_option: str) -> None:
     if CUDA_HOME is not None:
         return
@@ -163,46 +336,84 @@ def check_if_cuda_home_none(global_option: str) -> None:
     )
 
 
-def check_if_rocm_home_none(global_option: str) -> None:
-    if ROCM_HOME is not None:
+# Taken from https://github.com/pytorch/pytorch/blob/master/tools/setup_helpers/env.py
+def check_env_flag(name: str, default: str = "") -> bool:
+    return os.getenv(name, default).upper() in ["ON", "1", "YES", "TRUE", "Y"]
+
+
+# Copied from https://github.com/triton-lang/triton/blob/main/python/setup.py
+def is_offline_build() -> bool:
+    """
+    Downstream projects and distributions which bootstrap their own dependencies from scratch
+    and run builds in offline sandboxes
+    may set `FLASH_ATTENTION_OFFLINE_BUILD` in the build environment to prevent any attempts at downloading
+    pinned dependencies from the internet or at using dependencies vendored in-tree.
+
+    Dependencies must be defined using respective search paths (cf. `syspath_var_name` in `Package`).
+    Missing dependencies lead to an early abortion.
+    Dependencies' compatibility is not verified.
+
+    Note that this flag isn't tested by the CI and does not provide any guarantees.
+    """
+    return check_env_flag("FLASH_ATTENTION_OFFLINE_BUILD", "")
+
+
+# Copied from https://github.com/triton-lang/triton/blob/main/python/setup.py
+def get_flashattn_cache_path():
+    user_home = os.getenv("FLASH_ATTENTION_HOME")
+    if not user_home:
+        user_home = os.getenv("HOME") or os.getenv("USERPROFILE") or os.getenv("HOMEPATH") or None
+    if not user_home:
+        raise RuntimeError("Could not find user home directory")
+    return os.path.join(user_home, ".flashattn")
+
+
+def open_url(url):
+    user_agent = 'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0'
+    headers = {
+        'User-Agent': user_agent,
+    }
+    request = urllib.request.Request(url, None, headers)
+    # Set timeout to 300 seconds to prevent the request from hanging forever.
+    return urllib.request.urlopen(request, timeout=300)
+
+
+def download_and_copy(name, src_func, dst_path, version, url_func):
+    if is_offline_build():
         return
-    # warn instead of error because user could be downloading prebuilt wheels, so hipcc won't be necessary
-    # in that case.
-    warnings.warn(
-        f"{global_option} was requested, but hipcc was not found."
-    )
+    flashattn_cache_path = get_flashattn_cache_path()
+    base_dir = os.path.dirname(__file__)
+    system = platform.system()
+    arch = platform.machine()
+    arch = {"arm64": "aarch64"}.get(arch, arch)
+    supported = {"Linux": "linux", "Darwin": "linux"}
+    url = url_func(supported[system], arch, version)
+    src_path = src_func(supported[system], arch, version)
+    tmp_path = os.path.join(flashattn_cache_path, "nvidia", name)  # path to cache the download
+    dst_path = os.path.join(base_dir, os.pardir, "third_party", "nvidia", "backend", dst_path)  # final binary path
+    src_path = os.path.join(tmp_path, src_path)
+    download = not os.path.exists(src_path)
+    if download:
+        print(f'downloading and extracting {url} ...')
+        file = tarfile.open(fileobj=open_url(url), mode="r|*")
+        file.extractall(path=tmp_path)
+    os.makedirs(os.path.split(dst_path)[0], exist_ok=True)
+    print(f'copy {src_path} to {dst_path} ...')
+    if os.path.isdir(src_path):
+        shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+    else:
+        shutil.copy(src_path, dst_path)
 
 
-def detect_hipify_v2():
-    try:
-        from torch.utils.hipify import __version__
-        from packaging.version import Version
-        if Version(__version__) >= Version("2.0.0"):
-            return True
-    except Exception as e:
-        print("failed to detect pytorch hipify version, defaulting to version 1.0.0 behavior")
-        print(e)
-    return False
+def nvcc_threads_args():
+    nvcc_threads = os.getenv("NVCC_THREADS") or "2"
+    return ["--threads", nvcc_threads]
 
 
-def append_nvcc_threads(nvcc_extra_args):
-    nvcc_threads = os.getenv("NVCC_THREADS") or "4"
-    return nvcc_extra_args + ["--threads", nvcc_threads]
+# NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.3.107"}
+NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.6.85", "ptxas": "12.8.93"}
 
-
-def rename_cpp_to_cu(cpp_files):
-    for entry in cpp_files:
-        shutil.copy(entry, os.path.splitext(entry)[0] + ".cu")
-
-
-def validate_and_update_archs(archs):
-    # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx950", "gfx942"]
-
-    # Validate if each element in archs is in allowed_archs
-    assert all(
-        arch in allowed_archs for arch in archs
-    ), f"One of GPU archs of {archs} is invalid or not supported by Flash-Attention"
+exe_extension = sysconfig.get_config_var("EXE")
 
 
 cmdclass = {}
@@ -210,286 +421,217 @@ ext_modules = []
 
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
-if os.path.isdir(".git"):
-    if not SKIP_CK_BUILD:
-        subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
-        subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
-else:
-    if IS_ROCM:
-        if not SKIP_CK_BUILD:
-            assert (
-                os.path.exists("csrc/composable_kernel/example/ck_tile/01_fmha/generate.py")
-            ), "csrc/composable_kernel is missing, please use source distribution or git clone"
-    else:
-        assert (
-            os.path.exists("csrc/cutlass/include/cutlass/cutlass.h")
-        ), "csrc/cutlass is missing, please use source distribution or git clone"
+subprocess.run(["git", "submodule", "update", "--init", "third_party/cutlass"])
 
-if not SKIP_CUDA_BUILD and not IS_ROCM:
+if not SKIP_CUDA_BUILD:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
-    check_if_cuda_home_none("flash_attn")
-    # Check, if CUDA11 is installed for compute capability 8.0
+    create_build_config_file()
+    check_if_cuda_home_none(PACKAGE_NAME)
+    _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
+    if bare_metal_version < Version("12.3"):
+        raise RuntimeError("FlashAttention-3 is only supported on CUDA 12.3 and above")
+    elif bare_metal_version >= Version("13.0"):
+        # CUDA 13.0+ uses system nvcc and CCCL headers are in /usr/local/cuda/include/cccl/
+        cccl_include = os.path.join(CUDA_HOME, "include", "cccl")
+        for env_var in ["CPLUS_INCLUDE_PATH", "C_INCLUDE_PATH"]:
+            current = os.environ.get(env_var, "")
+            os.environ[env_var] = cccl_include + (":" + current if current else "")
+
+    # ptxas 12.8 gives the best perf currently
+    # We want to use the nvcc front end from 12.6 however, since if we use nvcc 12.8
+    # Cutlass 3.8 will expect the new data types in cuda.h from CTK 12.8, which we don't have.
+    # For CUDA 13.0+, use system nvcc instead of downloading CUDA 12.x toolchain
+    if bare_metal_version >= Version("12.3") and bare_metal_version < Version("13.0") and bare_metal_version != Version("12.8"):
+        download_and_copy(
+            name="nvcc",
+            src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin",
+            dst_path="bin",
+            version=NVIDIA_TOOLCHAIN_VERSION["nvcc"],
+            url_func=lambda system, arch, version:
+            f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
+        )
+        download_and_copy(
+            name="ptxas",
+            src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas",
+            dst_path="bin",
+            version=NVIDIA_TOOLCHAIN_VERSION["ptxas"],
+            url_func=lambda system, arch, version:
+            f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
+        )
+        download_and_copy(
+            name="ptxas",
+            src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/nvvm/bin",
+            dst_path="nvvm/bin",
+            version=NVIDIA_TOOLCHAIN_VERSION["ptxas"],
+            url_func=lambda system, arch, version:
+            f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
+        )
+        base_dir = os.path.dirname(__file__)
+        ctk_path_new = os.path.abspath(os.path.join(base_dir, os.pardir, "third_party", "nvidia", "backend", "bin"))
+        nvcc_path_new = os.path.join(ctk_path_new, f"nvcc{exe_extension}")
+        # Need to append to path otherwise nvcc can't find cicc in nvvm/bin/cicc
+        # nvcc 12.8 seems to hard-code looking for cicc in ../nvvm/bin/cicc
+        os.environ["PATH"] = ctk_path_new + os.pathsep + os.environ["PATH"]
+        os.environ["PYTORCH_NVCC"] = nvcc_path_new
+        # Make nvcc executable, sometimes after the copy it loses its permissions
+        os.chmod(nvcc_path_new, os.stat(nvcc_path_new).st_mode | stat.S_IEXEC)
+
     cc_flag = []
-    if CUDA_HOME is not None:
-        _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
-        if bare_metal_version < Version("11.7"):
-            raise RuntimeError(
-                "FlashAttention is only supported on CUDA 11.7 and above.  "
-                "Note: make sure nvcc has a supported version by running nvcc -V."
-            )
-        # Build -gencode (regular + PTX + family-specific 'f' when available)
-        add_cuda_gencodes(cc_flag, set(cuda_archs()), bare_metal_version)
-    else:
-        # No nvcc present; warnings already emitted above
-        pass
+    cc_flag.append("-gencode")
+    cc_flag.append("arch=compute_90a,code=sm_90a")
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
     # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
+    repo_dir = Path(this_dir)
+    cutlass_dir = repo_dir / "third_party" / "cutlass"
 
+    feature_args = (
+        []
+        + (["-DFLASHATTENTION_DISABLE_BACKWARD"] if DISABLE_BACKWARD else [])
+        + (["-DFLASHATTENTION_DISABLE_PAGEDKV"] if DISABLE_PAGEDKV else [])
+        + (["-DFLASHATTENTION_DISABLE_SPLIT"] if DISABLE_SPLIT else [])
+        + (["-DFLASHATTENTION_DISABLE_APPENDKV"] if DISABLE_APPENDKV else [])
+        + (["-DFLASHATTENTION_DISABLE_LOCAL"] if DISABLE_LOCAL else [])
+        + (["-DFLASHATTENTION_DISABLE_SOFTCAP"] if DISABLE_SOFTCAP else [])
+        + (["-DFLASHATTENTION_DISABLE_PACKGQA"] if DISABLE_PACKGQA else [])
+        + (["-DFLASHATTENTION_DISABLE_FP16"] if DISABLE_FP16 else [])
+        + (["-DFLASHATTENTION_DISABLE_FP8"] if DISABLE_FP8 else [])
+        + (["-DFLASHATTENTION_DISABLE_VARLEN"] if DISABLE_VARLEN else [])
+        + (["-DFLASHATTENTION_DISABLE_CLUSTER"] if DISABLE_CLUSTER else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIM64"] if DISABLE_HDIM64 else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIM96"] if DISABLE_HDIM96 else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIM128"] if DISABLE_HDIM128 else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIM192"] if DISABLE_HDIM192 else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIM256"] if DISABLE_HDIM256 else [])
+        + (["-DFLASHATTENTION_DISABLE_SM8x"] if DISABLE_SM8x else [])
+        + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIMDIFF64"] if DISABLE_HDIMDIFF64 else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIMDIFF192"] if DISABLE_HDIMDIFF192 else [])
+    )
+
+    DTYPE_FWD_SM80 = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
+    DTYPE_FWD_SM90 = ["bf16"] + (["fp16"] if not DISABLE_FP16 else []) + (["e4m3"] if not DISABLE_FP8 else [])
+    HALF_DTYPE_FWD_SM90 = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
+    DTYPE_BWD = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
+    HEAD_DIMENSIONS_BWD = (
+        []
+        + ([64] if not DISABLE_HDIM64 else [])
+        + ([96] if not DISABLE_HDIM96 else [])
+        + ([128] if not DISABLE_HDIM128 else [])
+        + ([192] if not DISABLE_HDIM192 else [])
+        + ([256] if not DISABLE_HDIM256 else [])
+    )
+    # build will now explode with this compilation grouping given all our templating
+    # HEAD_DIMENSIONS_FWD = ["all", "diff"]
+    HEAD_DIMENSIONS_FWD = HEAD_DIMENSIONS_BWD
+    HEAD_DIMENSIONS_DIFF64_FWD = (
+        []
+        + (["64_256"] if not DISABLE_HDIMDIFF64 else [])
+        + (["64_512"] if not DISABLE_HDIMDIFF64 else [])
+    )
+    HEAD_DIMENSIONS_DIFF192_FWD = (
+        []
+        + (["192_128"] if not DISABLE_HDIMDIFF192 else [])
+    )
+    HEAD_DIMENSIONS_FWD_SM80 = HEAD_DIMENSIONS_BWD
+    SPLIT = [""] + (["_split"] if not DISABLE_SPLIT else [])
+    PAGEDKV = [""] + (["_paged"] if not DISABLE_PAGEDKV else [])
+    SOFTCAP = [""] + (["_softcap"] if not DISABLE_SOFTCAP else [])
+    SOFTCAP_ALL = [""] if DISABLE_SOFTCAP else ["_softcapall"]
+    PACKGQA = [""] + (["_packgqa"] if not DISABLE_PACKGQA else [])
+    # We already always hard-code PackGQA=true for Sm8x
+    sources_fwd_sm80 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}_sm80.cu"
+                        for hdim, dtype, split, paged, softcap in itertools.product(HEAD_DIMENSIONS_FWD_SM80, DTYPE_FWD_SM80, SPLIT, PAGEDKV, SOFTCAP_ALL)]
+    # We already always hard-code PackGQA=true for Sm9x if PagedKV or Split
+    sources_fwd_sm90 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
+                        for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
+                        if not (packgqa and (paged or split))]
+    if not DISABLE_HDIMDIFF64:
+        sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
+                             for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF64_FWD, HALF_DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
+                             if not (packgqa and (paged or split))]
+    if not DISABLE_HDIMDIFF192:
+        sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
+                            for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF192_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
+                            if not (packgqa and (paged or split))]
+    sources_bwd_sm80 = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}{softcap}_sm80.cu"
+                        for hdim, dtype, softcap in itertools.product(HEAD_DIMENSIONS_BWD, DTYPE_BWD, SOFTCAP)]
+    sources_bwd_sm90 = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}{softcap}_sm90.cu"
+                        for hdim, dtype, softcap in itertools.product(HEAD_DIMENSIONS_BWD, DTYPE_BWD, SOFTCAP_ALL)]
+    if DISABLE_BACKWARD:
+        sources_bwd_sm90 = []
+        sources_bwd_sm80 = []
+    
+    # Choose between flash_api.cpp and flash_api_stable.cpp based on torch version
+    torch_version = parse(torch.__version__)
+    target_version = parse("2.9.0.dev20250830")
+    stable_args = []
+      
+    if torch_version >= target_version:
+        flash_api_source = "flash_api_stable.cpp"
+        stable_args = ["-DTORCH_STABLE_ONLY"]  # Checks against including unstable Tensor APIs
+    else:
+        flash_api_source = "flash_api.cpp"
+
+    sources = (
+        [flash_api_source]
+        + (sources_fwd_sm80 if not DISABLE_SM8x else []) + sources_fwd_sm90
+        + (sources_bwd_sm80 if not DISABLE_SM8x else []) + sources_bwd_sm90
+    )
+    if not DISABLE_SPLIT:
+        sources += ["flash_fwd_combine.cu"]
+    sources += ["flash_prepare_scheduler.cu"]
     nvcc_flags = [
-    "-O3",
-    "-std=c++17",
-    "-U__CUDA_NO_HALF_OPERATORS__",
-    "-U__CUDA_NO_HALF_CONVERSIONS__",
-    "-U__CUDA_NO_HALF2_OPERATORS__",
-    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-    "--expt-relaxed-constexpr",
-    "--expt-extended-lambda",
-    "--use_fast_math",
-    # "--ptxas-options=-v",
-    # "--ptxas-options=-O2",
-    # "-lineinfo",
-    # "-DFLASHATTENTION_DISABLE_BACKWARD",
-    # "-DFLASHATTENTION_DISABLE_DROPOUT",
-    # "-DFLASHATTENTION_DISABLE_ALIBI",
-    # "-DFLASHATTENTION_DISABLE_SOFTCAP",
-    # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
-    # "-DFLASHATTENTION_DISABLE_LOCAL",
+        "-O3",
+        "-std=c++17",
+        "--ftemplate-backtrace-limit=0",  # To debug template code
+        "--use_fast_math",
+        # "--keep",
+        # "--ptxas-options=--verbose,--register-usage-level=5,--warn-on-local-memory-usage",  # printing out number of registers
+        "--resource-usage",  # printing out number of registers
+        # f"--split-compile={os.getenv('NVCC_THREADS', '4')}",  # split-compile is faster
+        "-lineinfo",  # TODO: disable this for release to reduce binary size
+        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",  # Necessary for the WGMMA shapes that we use
+        "-DCUTLASS_ENABLE_GDC_FOR_SM90",  # For PDL
+        "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
+        "-DNDEBUG",  # Important, otherwise performance is severely impacted
+    ]
+    if get_platform() == "win_amd64":
+        nvcc_flags.extend(
+            [
+                "-D_USE_MATH_DEFINES",  # for M_LN2
+                "-Xcompiler=/Zc:__cplusplus",  # sets __cplusplus correctly, CUTLASS_CONSTEXPR_IF_CXX17 needed for cutlass::gcd
+            ]
+        )
+    include_dirs = [
+        Path(this_dir) / f"src/{PACKAGE_NAME}",
+        cutlass_dir / "include",
     ]
 
-    compiler_c17_flag=["-O3", "-std=c++17"]
-    # Add Windows-specific flags
-    if sys.platform == "win32" and os.getenv('DISTUTILS_USE_SDK') == '1':
-        nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus"])
-        compiler_c17_flag=["-O2", "/std:c++17", "/Zc:__cplusplus"]
-
+    # Prepend new path
+    sources = [f"src/{PACKAGE_NAME}/{x}" for x in sources]
     ext_modules.append(
         CUDAExtension(
-            name="flash_attn_2_cuda",
-            sources=[
-                "csrc/flash_attn/flash_api.cpp",
-                "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim96_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim192_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim192_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim256_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim256_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim32_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim32_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim64_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim64_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim96_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim96_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim128_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim128_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim192_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim192_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim256_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim256_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim32_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim32_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim64_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim64_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim96_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim96_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim128_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim128_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim192_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim192_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim256_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim256_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim32_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim32_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim64_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim64_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim96_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim96_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim128_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim128_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim192_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim192_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim256_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim256_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim32_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim32_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim64_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim64_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim96_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim96_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim128_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim192_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim192_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim32_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim32_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim64_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim64_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim96_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim96_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim128_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim192_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim192_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu",
-            ],
+            name=f"{PACKAGE_NAME}._C",
+            sources=sources,
             extra_compile_args={
-                "cxx": compiler_c17_flag,
-                "nvcc": append_nvcc_threads(nvcc_flags + cc_flag),
+                "cxx": ["-O3", "-std=c++17", "-DPy_LIMITED_API=0x03090000"] + stable_args + feature_args,
+                "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
             },
-            include_dirs=[
-                Path(this_dir) / "csrc" / "flash_attn",
-                Path(this_dir) / "csrc" / "flash_attn" / "src",
-                Path(this_dir) / "csrc" / "cutlass" / "include",
-            ],
+            include_dirs=include_dirs,
+            py_limited_api=True,
         )
     )
-elif not SKIP_CUDA_BUILD and IS_ROCM:
-    print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
-    TORCH_MAJOR = int(torch.__version__.split(".")[0])
-    TORCH_MINOR = int(torch.__version__.split(".")[1])
-
-    # Skips CK C++ extension compilation if using Triton Backend
-    if not SKIP_CK_BUILD:
-        ck_dir = "csrc/composable_kernel"
-
-        #use codegen get code dispatch
-        if not os.path.exists("./build"):
-            os.makedirs("build")
-
-        optdim = os.getenv("OPT_DIM", "32,64,128,256")
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-
-        # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
-        # See https://github.com/pytorch/pytorch/pull/70650
-        generator_flag = []
-        torch_dir = torch.__path__[0]
-        if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
-            generator_flag = ["-DOLD_GENERATOR_PATH"]
-
-        check_if_rocm_home_none("flash_attn")
-        archs = os.getenv("GPU_ARCHS", "native").split(";")
-        validate_and_update_archs(archs)
-
-        if archs != ['native']:
-            cc_flag = [f"--offload-arch={arch}" for arch in archs]
-        else:
-            arch = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
-            cc_flag = [f"--offload-arch={arch}"]
-
-        # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
-        # torch._C._GLIBCXX_USE_CXX11_ABI
-        # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
-        if FORCE_CXX11_ABI:
-            torch._C._GLIBCXX_USE_CXX11_ABI = True
-
-        sources = ["csrc/flash_attn_ck/flash_api.cpp",
-                "csrc/flash_attn_ck/flash_common.cpp",
-                "csrc/flash_attn_ck/mha_bwd.cpp",
-                "csrc/flash_attn_ck/mha_fwd_kvcache.cpp",
-                "csrc/flash_attn_ck/mha_fwd.cpp",
-                "csrc/flash_attn_ck/mha_varlen_bwd.cpp",
-                "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
-            f"build/fmha_*wd*.cpp"
-        )
-
-        # Check if torch is using hipify v2. Until CK is updated with HIPIFY_V2 macro,
-        # we must replace the incorrect APIs.
-        maybe_hipify_v2_flag = []
-        if detect_hipify_v2():
-            maybe_hipify_v2_flag = ["-DHIPIFY_V2"]
-
-        rename_cpp_to_cu(sources)
-
-        renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
-                        "csrc/flash_attn_ck/flash_common.cu",
-                        "csrc/flash_attn_ck/mha_bwd.cu",
-                        "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
-                        "csrc/flash_attn_ck/mha_fwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_bwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
-
-        cc_flag += ["-O3","-std=c++20",
-                    "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
-                    "-fgpu-flush-denormals-to-zero",
-                    "-DCK_ENABLE_BF16",
-                    "-DCK_ENABLE_BF8",
-                    "-DCK_ENABLE_FP16",
-                    "-DCK_ENABLE_FP32",
-                    "-DCK_ENABLE_FP64",
-                    "-DCK_ENABLE_FP8",
-                    "-DCK_ENABLE_INT8",
-                    "-DCK_USE_XDL",
-                    "-DUSE_PROF_API=1",
-                    # "-DFLASHATTENTION_DISABLE_BACKWARD",
-                    "-D__HIP_PLATFORM_HCC__=1"]
-
-        cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get('CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT', 3)}"]
-
-        # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
-        hip_version = get_hip_version()
-        if hip_version > Version('5.5.00000'):
-            cc_flag += ["-mllvm", "--lsr-drop-solution=1"]
-        if hip_version > Version('5.7.23302'):
-            cc_flag += ["-fno-offload-uniform-block"]
-        if hip_version > Version('6.1.40090'):
-            cc_flag += ["-mllvm", "-enable-post-misched=0"]
-        if hip_version > Version('6.2.41132'):
-            cc_flag += ["-mllvm", "-amdgpu-early-inline-all=true",
-                        "-mllvm", "-amdgpu-function-calls=false"]
-        if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
-            cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
-
-        extra_compile_args = {
-            "cxx": ["-O3", "-std=c++20"] + generator_flag + maybe_hipify_v2_flag,
-            "nvcc": cc_flag + generator_flag + maybe_hipify_v2_flag,
-        }
-
-        include_dirs = [
-            Path(this_dir) / "csrc" / "composable_kernel" / "include",
-            Path(this_dir) / "csrc" / "composable_kernel" / "library" / "include",
-            Path(this_dir) / "csrc" / "composable_kernel" / "example" / "ck_tile" / "01_fmha",
-        ]
-
-        ext_modules.append(
-            CUDAExtension(
-                name="flash_attn_2_cuda",
-                sources=renamed_sources,
-                extra_compile_args=extra_compile_args,
-                include_dirs=include_dirs,
-            )
-        )
 
 
 def get_package_version():
-    with open(Path(this_dir) / "flash_attn" / "__init__.py", "r") as f:
+    with open(Path(this_dir) / f"src/{PACKAGE_NAME}/__init__.py", "r") as f:
         version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
     local_version = os.environ.get("FLASH_ATTN_LOCAL_VERSION")
@@ -498,133 +640,27 @@ def get_package_version():
     else:
         return str(public_version)
 
-
-def get_wheel_url():
-    torch_version_raw = parse(torch.__version__)
-    python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
-    platform_name = get_platform()
-    flash_version = get_package_version()
-    torch_version = f"{torch_version_raw.major}.{torch_version_raw.minor}"
-    cxx11_abi = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper()
-
-    if IS_ROCM:
-        torch_hip_version = get_hip_version()
-        hip_version = f"{torch_hip_version.major}{torch_hip_version.minor}"
-        wheel_filename = f"{PACKAGE_NAME}-{flash_version}+rocm{hip_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
-    else:
-        # Determine the version numbers that will be used to determine the correct wheel
-        # We're using the CUDA version used to build torch, not the one currently installed
-        # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
-        torch_cuda_version = parse(torch.version.cuda)
-        # For CUDA 11, we only compile for CUDA 11.8, and for CUDA 12 we only compile for CUDA 12.3
-        # to save CI time. Minor versions should be compatible.
-        torch_cuda_version = parse("11.8") if torch_cuda_version.major == 11 else parse("12.3")
-        # cuda_version = f"{cuda_version_raw.major}{cuda_version_raw.minor}"
-        cuda_version = f"{torch_cuda_version.major}"
-
-        # Determine wheel URL based on CUDA version, torch version, python version and OS
-        wheel_filename = f"{PACKAGE_NAME}-{flash_version}+cu{cuda_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
-
-    wheel_url = BASE_WHEEL_URL.format(tag_name=f"v{flash_version}", wheel_name=wheel_filename)
-
-    return wheel_url, wheel_filename
-
-
-class CachedWheelsCommand(_bdist_wheel):
-    """
-    The CachedWheelsCommand plugs into the default bdist wheel, which is ran by pip when it cannot
-    find an existing wheel (which is currently the case for all flash attention installs). We use
-    the environment parameters to detect whether there is already a pre-built version of a compatible
-    wheel available and short-circuits the standard full build pipeline.
-    """
-
-    def run(self):
-        if FORCE_BUILD:
-            return super().run()
-
-        wheel_url, wheel_filename = get_wheel_url()
-        print("Guessing wheel URL: ", wheel_url)
-        try:
-            urllib.request.urlretrieve(wheel_url, wheel_filename)
-
-            # Make the archive
-            # Lifted from the root wheel processing command
-            # https://github.com/pypa/wheel/blob/cf71108ff9f6ffc36978069acb28824b44ae028e/src/wheel/bdist_wheel.py#LL381C9-L381C85
-            if not os.path.exists(self.dist_dir):
-                os.makedirs(self.dist_dir)
-
-            impl_tag, abi_tag, plat_tag = self.get_tag()
-            archive_basename = f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
-
-            wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
-            print("Raw wheel path", wheel_path)
-            os.rename(wheel_filename, wheel_path)
-        except (urllib.error.HTTPError, urllib.error.URLError):
-            print("Precompiled wheel not found. Building from source...")
-            # If the wheel could not be downloaded, build from source
-            super().run()
-
-
-class NinjaBuildExtension(BuildExtension):
-    def __init__(self, *args, **kwargs) -> None:
-        # do not override env MAX_JOBS if already exists
-        if not os.environ.get("MAX_JOBS"):
-            import psutil
-
-            # calculate the maximum allowed NUM_JOBS based on cores
-            max_num_jobs_cores = max(1, os.cpu_count() // 2)
-
-            # calculate the maximum allowed NUM_JOBS based on free memory
-            free_memory_gb = psutil.virtual_memory().available / (1024 ** 3)  # free memory in GB
-            max_num_jobs_memory = int(free_memory_gb / 9)  # each JOB peak memory cost is ~8-9GB when threads = 4
-
-            # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-            max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
-            os.environ["MAX_JOBS"] = str(max_jobs)
-
-        super().__init__(*args, **kwargs)
-
-
 setup(
     name=PACKAGE_NAME,
     version=get_package_version(),
-    packages=find_packages(
-        exclude=(
-            "build",
-            "csrc",
-            "include",
-            "tests",
-            "dist",
-            "docs",
-            "benchmarks",
-            "flash_attn.egg-info",
-        )
-    ),
-    author="Tri Dao",
-    author_email="tri@tridao.me",
-    description="Flash Attention: Fast and Memory-Efficient Exact Attention",
+    package_dir={"": "src"},
+    packages=[PACKAGE_NAME],
+    description="FlashAttention-3",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/Dao-AILab/flash-attention",
     classifiers=[
         "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: BSD License",
+        "License :: OSI Approved :: Apache Software License",
         "Operating System :: Unix",
     ],
     ext_modules=ext_modules,
-    cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": NinjaBuildExtension}
-    if ext_modules
-    else {
-        "bdist_wheel": CachedWheelsCommand,
-    },
-    python_requires=">=3.9",
+    cmdclass={"build_ext": BuildExtension},
+    python_requires=">=3.8",
     install_requires=[
         "torch",
         "einops",
-    ],
-    setup_requires=[
         "packaging",
-        "psutil",
         "ninja",
     ],
+    options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
