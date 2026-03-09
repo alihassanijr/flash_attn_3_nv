@@ -938,7 +938,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     } else {
         out = !is_varlen_q
             ? torch::stable::new_empty(q, {batch_size, seqlen_q, num_heads, head_size_v}, std::make_optional(out_type))
-            : torch::stable::new_empty(q, {total_q, num_heads, head_size_v}, std::make_optional(out_type));
+            : torch::stable::new_zeros(q, {total_q, num_heads, head_size_v}, std::make_optional(out_type));
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -955,7 +955,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     if (!is_varlen_q) {
         softmax_lse = torch::stable::new_empty(q, {batch_size, num_heads, seqlen_q}, std::make_optional(torch::headeronly::ScalarType::Float));
     } else {
-        softmax_lse = torch::stable::new_empty(q, {num_heads, total_q}, std::make_optional(torch::headeronly::ScalarType::Float));
+        softmax_lse = torch::stable::new_zeros(q, {num_heads, total_q}, std::make_optional(torch::headeronly::ScalarType::Float));
     }
 
     Flash_fwd_params params;
@@ -1166,8 +1166,8 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
             params.oaccum_batch_stride = out_accum.stride(1);
             params.lseaccum_batch_stride = softmax_lse_accum.stride(1);
         } else {
-            out_accum = torch::stable::new_empty(q, {params.num_splits, num_heads, total_q, head_size_v}, std::make_optional(outaccum_type));
-            softmax_lse_accum = torch::stable::new_empty(q, {params.num_splits, num_heads, total_q}, std::make_optional(torch::headeronly::ScalarType::Float));
+            out_accum = torch::stable::new_zeros(q, {params.num_splits, num_heads, total_q, head_size_v}, std::make_optional(outaccum_type));
+            softmax_lse_accum = torch::stable::new_zeros(q, {params.num_splits, num_heads, total_q}, std::make_optional(torch::headeronly::ScalarType::Float));
         }
         params.is_fp32 = false;
         params.oaccum_ptr = out_accum.data_ptr();
