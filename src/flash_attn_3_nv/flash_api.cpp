@@ -871,7 +871,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     } else {
         out = !is_varlen_q
             ? torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(out_type))
-            : torch::empty({total_q, num_heads, head_size_v}, opts.dtype(out_type));
+            : torch::zeros({total_q, num_heads, head_size_v}, opts.dtype(out_type));
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -888,7 +888,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     if (!is_varlen_q) {
         softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     } else {
-        softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+        softmax_lse = torch::zeros({num_heads, total_q}, opts.dtype(at::kFloat));
     }
 
     Flash_fwd_params params;
@@ -1099,8 +1099,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             params.oaccum_batch_stride = out_accum.stride(1);
             params.lseaccum_batch_stride = softmax_lse_accum.stride(1);
         } else {
-            out_accum = torch::empty({params.num_splits, num_heads, total_q, head_size_v}, opts.dtype(outaccum_type));
-            softmax_lse_accum = torch::empty({params.num_splits, num_heads, total_q}, opts.dtype(at::kFloat));
+            out_accum = torch::zeros({params.num_splits, num_heads, total_q, head_size_v}, opts.dtype(outaccum_type));
+            softmax_lse_accum = torch::zeros({params.num_splits, num_heads, total_q}, opts.dtype(at::kFloat));
         }
         params.is_fp32 = false;
         params.oaccum_ptr = out_accum.data_ptr();
